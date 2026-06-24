@@ -1,0 +1,38 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+
+# Editor and IDE config
+.vscode/
+.idea/
+
+# Streamlit local config
+.streamlit/
+
+# Data files and large assets
+dataset_refriperu.csv
+*.csv
+
+# Logs and local state
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Jupyter
+.ipynb_checkpoints/
