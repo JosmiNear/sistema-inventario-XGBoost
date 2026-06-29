@@ -350,12 +350,17 @@ def render_dashboard(df: pd.DataFrame, metrics: dict, suggestions: pd.DataFrame)
     trend_df["Predicción XGBoost"] = trend_df["Stock_Total"].shift(-1)
     trend_df["Predicción XGBoost"] = trend_df["Predicción XGBoost"].ffill().bfill()
 
-    line = alt.Chart(trend_df).mark_line(point=True).encode(
-        x="Date:T",
-        y=alt.Y("Stock_Total:Q", title="Stock Total (miles)"),
-        tooltip=["Date", "Stock_Total", "Predicción XGBoost"]
-    ).properties(width="100%", height=360)
-    st.altair_chart(line, width='stretch')
+    line = (
+        alt.Chart(trend_df)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("Date:T", title="Fecha"),
+            y=alt.Y("Stock_Total:Q", title="Stock Total"),
+            tooltip=["Date:T", "Stock_Total:Q", "Predicción XGBoost:Q"],
+        )
+        .properties(width=800, height=360)
+    )
+    st.altair_chart(line, use_container_width=True)
 
     st.markdown("### Controles de filtrado rápido")
     filter_col1, filter_col2, filter_col3 = st.columns(3)
