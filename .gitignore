@@ -17,10 +17,6 @@ env.bak/
 # Streamlit local config
 .streamlit/
 
-# Data files and large assets
-dataset_refriperu.csv
-*.csv
-
 # Logs and local state
 *.log
 
