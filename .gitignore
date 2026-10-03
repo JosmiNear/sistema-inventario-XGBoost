@@ -14,8 +14,9 @@ env.bak/
 .vscode/
 .idea/
 
-# Streamlit local config
-.streamlit/
+# Streamlit: se versiona solo el tema (secrets.toml queda fuera)
+.streamlit/*
+!.streamlit/config.toml
 
 # Logs and local state
 *.log

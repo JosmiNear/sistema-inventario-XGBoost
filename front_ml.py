@@ -91,31 +91,63 @@ NO_MOVEMENT_WEEKS = 8
 OVERSTOCK_COVER_WEEKS = 4
 STATUS_ORDER = ["Crítico", "Bajo", "Óptimo", "Sobrestock", "Sin Movimiento"]
 STATUS_ICON = {"Crítico": "🔴", "Bajo": "🟠", "Óptimo": "🟢", "Sobrestock": "🔵", "Sin Movimiento": "⚪"}
-STATUS_COLOR = {"Crítico": "#dc2626", "Bajo": "#f59e0b", "Óptimo": "#16a34a",
-                "Sobrestock": "#2563eb", "Sin Movimiento": "#9ca3af"}
 CATEGORIES = ["Climatización", "Refrigeración", "Ventilación", "Componentes"]
 
-# ===== Estilos corporativos nativos =====
-CUSTOM_CSS = """
+# ===== Identidad visual (colores extraídos de logorefri.jpg) =====
+LOGO_PATH = os.path.join(os.path.dirname(__file__), "logorefri.jpg")
+BRAND_BLUE = "#2673FF"   # "Refri" / trazo azul del isotipo
+BRAND_RED = "#DD151F"    # "Perú" / trazo rojo del isotipo
+BRAND_TEXT = "#1F2937"
+BRAND_MUTED = "#6B7280"
+BRAND_BORDER = "#E3EAF7"
+BRAND_BG = "#F5F8FF"
+
+# Semántica de stock: rojo de marca para Crítico, azul de marca para Sobrestock
+STATUS_COLOR = {"Crítico": BRAND_RED, "Bajo": "#F59E0B", "Óptimo": "#16A34A",
+                "Sobrestock": BRAND_BLUE, "Sin Movimiento": "#9CA3AF"}
+
+# ===== Estilos corporativos =====
+CUSTOM_CSS = f"""
 <style>
-    .stApp {
-        background: #f5f8fb;
-        color: #1f2937;
-    }
-    .card {
-        background: #ffffff;
-        border-radius: 18px;
-        padding: 24px;
-        box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
-        margin-bottom: 20px;
-    }
-    .metric-label {
-        color: #4b5563;
-    }
-    .metric-value {
-        color: #111827;
+    .block-container {{
+        padding-top: 2rem;
+    }}
+    [data-testid="stSidebar"] {{
+        background: #FFFFFF;
+        border-right: 1px solid {BRAND_BORDER};
+    }}
+    [data-testid="stMetric"] {{
+        background: #FFFFFF;
+        border: 1px solid {BRAND_BORDER};
+        border-radius: 12px;
+        padding: 14px 18px;
+        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.06);
+    }}
+    [data-testid="stMetricLabel"] {{
+        color: {BRAND_MUTED};
+    }}
+    [data-testid="stMetricValue"] {{
+        color: {BRAND_TEXT};
         font-weight: 700;
-    }
+    }}
+    .rp-title {{
+        margin: 0;
+        font-size: 1.75rem;
+        font-weight: 700;
+        line-height: 1.2;
+    }}
+    .rp-title .refri {{ color: {BRAND_BLUE}; }}
+    .rp-title .peru {{ color: {BRAND_RED}; }}
+    .rp-subtitle {{
+        margin: 4px 0 0;
+        color: {BRAND_MUTED};
+        font-size: 0.95rem;
+    }}
+    .rp-header {{
+        border-bottom: 3px solid {BRAND_BLUE};
+        padding-bottom: 12px;
+        margin-bottom: 18px;
+    }}
 </style>
 """
 
@@ -405,14 +437,37 @@ def download_csv(dataframe: pd.DataFrame, filename: str):
     return buffer.getvalue().encode("utf-8")
 
 
+@st.cache_data(show_spinner=False)
+def load_logo():
+    """Logo recortado a su contenido (el original tiene mucho margen blanco); None si no existe."""
+    if not os.path.exists(LOGO_PATH):
+        return None
+    from PIL import Image, ImageOps
+
+    image = Image.open(LOGO_PATH).convert("RGB")
+    bbox = ImageOps.invert(image).point(lambda v: 255 if v > 24 else 0).getbbox()
+    if bbox:
+        pad = 24
+        image = image.crop((max(bbox[0] - pad, 0), max(bbox[1] - pad, 0),
+                            min(bbox[2] + pad, image.width), min(bbox[3] + pad, image.height)))
+    return image
+
+
 def render_header():
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
-    st.title(APP_TITLE)
-    st.markdown(
-        "<div style='padding: 12px 0 18px; font-size:16px; color:#374151;'>"
-        "Plataforma unificada de pronóstico y ordenes logísticas con XGBoost asimétrico.</div>",
-        unsafe_allow_html=True,
-    )
+    logo = load_logo()
+    with st.container():
+        logo_col, title_col = st.columns([1, 9], vertical_alignment="center")
+        if logo is not None:
+            logo_col.image(logo, width=96)
+        title_col.markdown(
+            "<div class='rp-header'>"
+            "<p class='rp-title'><span class='refri'>Refri</span><span class='peru'>Perú</span> "
+            "<span style='color:#1F2937; font-weight:600;'>Analytics</span></p>"
+            "<p class='rp-subtitle'>Pronóstico de demanda y gestión de inventario HVAC con XGBoost</p>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
 
 def render_login():
@@ -440,8 +495,12 @@ def render_login():
 def render_sidebar_menu():
     user_label = st.session_state.get("user_label", "Usuario")
     role = st.session_state.get("role", "Analista Logístico")
-    st.sidebar.markdown(f"### Hola, {user_label}")
-    st.sidebar.markdown(f"**Rol:** {role}")
+    st.sidebar.markdown(
+        f"<div style='font-size:1.1rem; font-weight:700; color:{BRAND_TEXT};'>Hola, {user_label}</div>"
+        f"<span style='display:inline-block; margin-top:6px; padding:2px 10px; border-radius:999px; "
+        f"background:#EAF1FF; color:{BRAND_BLUE}; font-size:0.8rem; font-weight:600;'>{role}</span>",
+        unsafe_allow_html=True,
+    )
     st.sidebar.divider()
 
     pages = ROLE_PAGES.get(role, ROLE_PAGES["Analista Logístico"])
@@ -530,7 +589,7 @@ def render_status_summary(state: pd.DataFrame):
         )
         .properties(height=200)
     )
-    st.altair_chart(chart)
+    st.altair_chart(chart, width="stretch")
 
 
 def render_forecast_chart(df: pd.DataFrame, forecaster: dict, forecast_df: pd.DataFrame, sku: str):
@@ -556,7 +615,7 @@ def render_forecast_chart(df: pd.DataFrame, forecaster: dict, forecast_df: pd.Da
             x=alt.X("Date:T", title="Semana"),
             y=alt.Y("valor:Q", title="Unidades (miles)"),
             color=alt.Color("serie:N", title=None,
-                            scale=alt.Scale(domain=series_domain, range=["#1f2937", "#2563eb"])),
+                            scale=alt.Scale(domain=series_domain, range=[BRAND_TEXT, BRAND_BLUE])),
             strokeDash=alt.StrokeDash("serie:N", legend=None,
                                       scale=alt.Scale(domain=series_domain, range=[[1, 0], [4, 4]])),
             tooltip=[alt.Tooltip("Date:T", title="Semana"), "serie:N",
@@ -573,13 +632,13 @@ def render_forecast_chart(df: pd.DataFrame, forecaster: dict, forecast_df: pd.Da
         alt.Tooltip("rmse_usado:Q", title="RMSE usado", format=".2f"),
     ]
     base_t1 = alt.Chart(point_df)
-    interval = base_t1.mark_rule(color="#dc2626", strokeWidth=2).encode(
+    interval = base_t1.mark_rule(color=BRAND_RED, strokeWidth=2).encode(
         x="fecha_t1:T", y="ci_low:Q", y2="ci_high:Q", tooltip=tooltip_t1
     )
-    point = base_t1.mark_point(size=160, filled=True, color="#dc2626").encode(
+    point = base_t1.mark_point(size=160, filled=True, color=BRAND_RED).encode(
         x="fecha_t1:T", y="forecast_t1:Q", tooltip=tooltip_t1
     )
-    st.altair_chart((lines + interval + point).properties(height=380))
+    st.altair_chart((lines + interval + point).properties(height=380), width="stretch")
 
     fuente = point_df["rmse_fuente"].iloc[0] if not point_df.empty else "Global"
     st.caption(f"IC 95% = ŷ ± {Z_CI} · RMSE ({fuente})")
@@ -635,28 +694,31 @@ def render_dashboard(state: pd.DataFrame, forecaster: dict):
     render_quality_badge(forecaster)
 
     metrics = forecaster["metrics"]
-    cols = st.columns(3)
-    cols[0].metric("RMSE (validación)", f"{metrics['rmse']:.2f}")
-    cols[1].metric("MAE (validación)", f"{metrics['mae']:.2f}")
-    cols[2].metric("SKUs totales", f"{state['sku'].nunique()}")
+    with st.container():
+        cols = st.columns(3, gap="medium")
+        cols[0].metric("RMSE (validación)", f"{metrics['rmse']:.2f}")
+        cols[1].metric("MAE (validación)", f"{metrics['mae']:.2f}")
+        cols[2].metric("SKUs totales", f"{state['sku'].nunique()}")
 
-    st.markdown("### Estado del inventario")
-    filtered = apply_category_filter(state)
-    render_status_summary(filtered)
+    with st.container(border=True):
+        st.markdown("#### Estado del inventario")
+        filtered = apply_category_filter(state)
+        render_status_summary(filtered)
 
-    st.markdown("### Top 10 SKUs a reponer (Crítico / Bajo)")
-    urgent = filtered[filtered["status"].isin(["Crítico", "Bajo"])]
-    if urgent.empty:
-        st.success("No hay SKUs en estado Crítico o Bajo con el filtro actual.")
-        return
-    rank = {status: i for i, status in enumerate(STATUS_ORDER)}
-    top = (
-        urgent.assign(_rank=urgent["status"].map(rank))
-        .sort_values(["_rank", "order_qty"], ascending=[True, False])
-        .head(10)
-        .drop(columns="_rank")
-    )
-    render_inventory_policy_table(top)
+    with st.container(border=True):
+        st.markdown("#### Top 10 SKUs a reponer (Crítico / Bajo)")
+        urgent = filtered[filtered["status"].isin(["Crítico", "Bajo"])]
+        if urgent.empty:
+            st.success("No hay SKUs en estado Crítico o Bajo con el filtro actual.")
+            return
+        rank = {status: i for i, status in enumerate(STATUS_ORDER)}
+        top = (
+            urgent.assign(_rank=urgent["status"].map(rank))
+            .sort_values(["_rank", "order_qty"], ascending=[True, False])
+            .head(10)
+            .drop(columns="_rank")
+        )
+        render_inventory_policy_table(top)
 
 
 def render_forecast_page(df: pd.DataFrame, state: pd.DataFrame, forecaster: dict):
@@ -885,7 +947,7 @@ def print_console_report(metrics: dict, source: str):
 def main():
     st.set_page_config(
         page_title=APP_TITLE,
-        page_icon="📈",
+        page_icon=logo if (logo := load_logo()) is not None else "📈",
         layout="wide",
         initial_sidebar_state="expanded",
     )
