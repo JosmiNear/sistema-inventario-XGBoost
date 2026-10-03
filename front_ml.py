@@ -2,10 +2,13 @@
 
 Esta aplicación es la interface final de RefriPerú con:
 - Login seguro con roles (Analista Logístico / Administrador)
-- Modelo XGBoost asimétrico simulado / compatible con carga real
-- Métricas de desempeño impresas en consola al iniciar
-- Dashboard, sugerencias de pedidos, logs, auditoría y configuración
-- Botones y descargas 100% funcionales
+- Regresor XGBoost de demanda semanal por SKU (lags + media móvil), entrenado
+  una vez con corte temporal 80/20 y persistido en models/xgb_forecast_reg.json
+- Pronóstico T+1 con intervalo de confianza 95% (ŷ ± 1.96·RMSE)
+- Política de inventario: stock de seguridad, punto de reorden, estado del SKU
+  y cantidad sugerida de pedido (el stock actual es SIMULADO)
+- Métricas RMSE / MAE / MAPE impresas en consola una vez por sesión
+- Dashboard, pronóstico, sugerencias de pedidos, logs, auditoría y configuración
 
 Para ejecutar:
     pip install -r requirements.txt
@@ -30,8 +33,6 @@ except ImportError as exc:
         "Ejecute: pip install -r requirements.txt"
     )
 
-from sklearn.metrics import accuracy_score, f1_score, recall_score, roc_auc_score
-
 # ===== Configuración global =====
 APP_TITLE = "RefriPerú Analytics - Dashboard Logístico"
 DATASET_PATH = os.path.join(os.path.dirname(__file__), "dataset_refriperu.csv")
@@ -55,10 +56,12 @@ USERS = {
 ROLE_PAGES = {
     "Analista Logístico": [
         "Dashboard General",
+        "Pronóstico de Demanda",
         "Sugerencia de Pedidos"
     ],
     "Administrador": [
         "Dashboard General",
+        "Pronóstico de Demanda",
         "Sugerencia de Pedidos",
         "Logs del Sistema",
         "Auditoría de Datos",
@@ -72,6 +75,25 @@ DEFAULT_MODEL_CONFIG = {
     "n_estimators": 120,
     "scale_pos_weight": 2.2
 }
+
+MODEL_FILE_REG = os.path.join(MODEL_FOLDER, "xgb_forecast_reg.json")
+FEATURES_REG = ["lag_1", "lag_2", "rolling_mean_4", "week_of_year", "IsHoliday", "Temperatura_Promedio"]
+REG_PARAMS = dict(objective="reg:squarederror", n_estimators=300, learning_rate=0.05, max_depth=6,
+                  subsample=0.8, colsample_bytree=0.8, random_state=42, verbosity=0)
+Z_CI = 1.96               # IC 95%
+MAPE_TARGET = 15.0        # %
+MAPE_MIN_ABS = 1.0        # excluir |y| < 1.0 (mil $) del MAPE
+MIN_VAL_POINTS_SKU = 8    # mínimo de puntos de validación para usar RMSE propio del SKU
+LEAD_TIME_WEEKS = 2
+Z_SERVICE = 1.65          # nivel de servicio 95%
+DEMAND_WINDOW_WEEKS = 12  # ventana para μ y σ
+NO_MOVEMENT_WEEKS = 8
+OVERSTOCK_COVER_WEEKS = 4
+STATUS_ORDER = ["Crítico", "Bajo", "Óptimo", "Sobrestock", "Sin Movimiento"]
+STATUS_ICON = {"Crítico": "🔴", "Bajo": "🟠", "Óptimo": "🟢", "Sobrestock": "🔵", "Sin Movimiento": "⚪"}
+STATUS_COLOR = {"Crítico": "#dc2626", "Bajo": "#f59e0b", "Óptimo": "#16a34a",
+                "Sobrestock": "#2563eb", "Sin Movimiento": "#9ca3af"}
+CATEGORIES = ["Climatización", "Refrigeración", "Ventilación", "Componentes"]
 
 # ===== Estilos corporativos nativos =====
 CUSTOM_CSS = """
@@ -110,11 +132,11 @@ def reset_session_state():
         "category_filter",
         "sku_filter",
         "order_history",
-        "model_metrics",
-        "suggested_orders",
+        "inventory_state",
+        "order_filter",
+        "order_flash",
         "dataset_processed",
-        "core_parameters",
-        "stock_snapshot"
+        "core_parameters"
     ]:
         if key in st.session_state:
             del st.session_state[key]
@@ -140,123 +162,240 @@ def load_dataset() -> pd.DataFrame:
     df = df.loc[df["Store"] == 1].copy()
     df["Week"] = df["Date"].dt.strftime("%Y-%U")
     df["unidades"] = df["Weekly_Sales"] / 1000.0
+    # Temperatura simulada solo estacional: no debe depender de Weekly_Sales
+    # (es feature del regresor y filtraría la variable objetivo).
     df["Temperatura_Promedio"] = (
         14.0
         + 8.0 * np.sin(2 * np.pi * df["Date"].dt.dayofyear / 365.0)
-        + 0.12 * df["Weekly_Sales"] / 1000.0
     )
     df["Temperatura_Promedio"] = df["Temperatura_Promedio"].interpolate(method="linear").round(1)
     df["IsHoliday"] = df["IsHoliday"].astype(str).str.upper().map({"TRUE": 1, "FALSE": 0})
     df["IsHoliday"] = df["IsHoliday"].fillna(0).astype(int)
 
-    # Variable binaria de demanda alta para clasificación estable
-    threshold = df["unidades"].median()
-    df["demanda_alta"] = (df["unidades"] > threshold).astype(int)
-    df["sku"] = df.apply(lambda row: f"SKU-{int(row['Dept']):03d}", axis=1)
-    df["categoria"] = df["Dept"].map({1: "Climatización", 2: "Refrigeración", 3: "Ventilación"}).fillna("Componentes")
+    df["sku"] = "SKU-" + df["Dept"].astype(int).astype(str).str.zfill(3)
+    df["categoria"] = dept_to_category(df["Dept"])
 
-    return df
+    # Features de series de tiempo por SKU (solo información pasada)
+    df = df.sort_values(["sku", "Date"])
+    grouped = df.groupby("sku")["unidades"]
+    df["lag_1"] = grouped.shift(1)
+    df["lag_2"] = grouped.shift(2)
+    df["rolling_mean_4"] = grouped.transform(lambda s: s.shift(1).rolling(4, min_periods=1).mean())
+    df["week_of_year"] = df["Date"].dt.isocalendar().week.astype(int)
+
+    return df.reset_index(drop=True)
 
 
-def build_synthetic_xgb(df: pd.DataFrame):
-    """Genera un modelo sintético de predicción estable y consitente con benchmarks."""
-    features = ["unidades", "Temperatura_Promedio", "IsHoliday"]
-    X = df[features].copy()
-    y = df["demanda_alta"].copy()
+def dept_to_category(dept: pd.Series) -> pd.Series:
+    """Asigna categoría por rango de Dept: 1-25, 26-50, 51-75 y resto."""
+    return pd.cut(
+        dept,
+        bins=[-np.inf, 25, 50, 75, np.inf],
+        labels=CATEGORIES,
+    ).astype(str)
 
-    split = int(len(df) * 0.75)
-    X_train = X.iloc[:split]
-    X_val = X.iloc[split:]
-    y_train = y.iloc[:split]
-    y_val = y.iloc[split:]
 
-    try:
-        from xgboost import XGBClassifier
-        model = XGBClassifier(
-            objective="binary:logistic",
-            eval_metric="auc",
-            use_label_encoder=False,
-            n_estimators=DEFAULT_MODEL_CONFIG["n_estimators"],
-            learning_rate=DEFAULT_MODEL_CONFIG["learning_rate"],
-            max_depth=DEFAULT_MODEL_CONFIG["max_depth"],
-            scale_pos_weight=DEFAULT_MODEL_CONFIG["scale_pos_weight"],
-            random_state=42,
-            verbosity=0,
-        )
+def build_forecast_features(df: pd.DataFrame):
+    """Devuelve (X, y, meta) para el regresor, solo con filas que tienen lag_1 y lag_2."""
+    data = df.loc[df["lag_1"].notna() & df["lag_2"].notna()]
+    X = data[FEATURES_REG].astype(float)
+    y = data["unidades"].astype(float)
+    meta = data[["sku", "categoria", "Date"]].copy()
+    return X, y, meta
 
-        model.fit(X_train, y_train)
-        if not os.path.exists(MODEL_FOLDER):
-            os.makedirs(MODEL_FOLDER, exist_ok=True)
+
+def compute_regression_metrics(y_true, y_pred) -> dict:
+    """RMSE, MAE y MAPE (%) del pronóstico; el MAPE excluye |y| < MAPE_MIN_ABS."""
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    error = y_pred - y_true
+    n = int(len(y_true))
+    rmse = float(np.sqrt(np.mean(error ** 2))) if n else 0.0
+    mae = float(np.mean(np.abs(error))) if n else 0.0
+    mask = np.abs(y_true) >= MAPE_MIN_ABS
+    n_mape = int(mask.sum())
+    mape = float(np.mean(np.abs(error[mask] / y_true[mask])) * 100) if n_mape else float("nan")
+    return {
+        "rmse": round(rmse, 3),
+        "mae": round(mae, 3),
+        "mape": round(mape, 3),
+        "n": n,
+        "n_mape": n_mape
+    }
+
+
+@st.cache_resource(show_spinner="Cargando modelo de pronóstico…")
+def train_or_load_forecaster() -> dict:
+    """Carga el regresor persistido (o lo entrena una vez) y lo evalúa en validación temporal."""
+    from xgboost import XGBRegressor
+
+    df = load_dataset()
+    X, y, meta = build_forecast_features(df)
+
+    dates = np.sort(meta["Date"].unique())
+    cutoff = dates[int(len(dates) * 0.8)]
+    train_mask = (meta["Date"] < cutoff).to_numpy()
+    val_mask = ~train_mask
+
+    model, source = None, "entrenado"
+    if os.path.exists(MODEL_FILE_REG):
         try:
-            model.save_model(MODEL_FILE_BIN)
+            candidate = XGBRegressor()
+            candidate.load_model(MODEL_FILE_REG)
+            if list(candidate.get_booster().feature_names or []) == FEATURES_REG:
+                model, source = candidate, "cargado"
         except Exception:
-            pass
+            model = None
 
-        y_pred = model.predict(X_val)
-        y_proba = model.predict_proba(X_val)[:, 1]
-    except Exception:
-        # Fallback determinista cuando no está XGBoost disponible
-        score = (
-            0.42 * X_val["unidades"]
-            + 0.33 * (X_val["Temperatura_Promedio"] / 20.0)
-            + 0.25 * X_val["IsHoliday"]
-        )
-        y_proba = 1 / (1 + np.exp(-(score - 0.8)))
-        y_pred = (y_proba > 0.56).astype(int)
-        model = None
+    if model is None:
+        model = XGBRegressor(**REG_PARAMS)
+        model.fit(X[train_mask], y[train_mask])
+        os.makedirs(MODEL_FOLDER, exist_ok=True)
+        model.save_model(MODEL_FILE_REG)
 
-    metrics = compute_metrics(y_val.to_numpy(), y_pred, y_proba)
+    val_df = meta.loc[val_mask].copy()
+    val_df["real"] = y[val_mask].to_numpy()
+    val_df["pred"] = model.predict(X[val_mask])
+
+    metrics = compute_regression_metrics(val_df["real"], val_df["pred"])
+    rmse_by_sku = {
+        sku: compute_regression_metrics(group["real"], group["pred"])["rmse"]
+        for sku, group in val_df.groupby("sku")
+        if len(group) >= MIN_VAL_POINTS_SKU
+    }
+    metrics_by_category = {
+        categoria: compute_regression_metrics(group["real"], group["pred"])
+        for categoria, group in val_df.groupby("categoria")
+    }
+
     return {
         "model": model,
-        "X_val": X_val,
-        "y_val": y_val,
-        "y_pred": y_pred,
-        "y_proba": y_proba,
-        "metrics": metrics
+        "metrics": metrics,
+        "rmse_by_sku": rmse_by_sku,
+        "metrics_by_category": metrics_by_category,
+        "val_df": val_df.reset_index(drop=True),
+        "source": source
     }
 
 
-def compute_metrics(y_true, y_pred, y_proba):
-    """Calcula métricas de clasificación estables."""
-    try:
-        accuracy = accuracy_score(y_true, y_pred)
-        f1 = f1_score(y_true, y_pred, zero_division=0)
-        recall = recall_score(y_true, y_pred, zero_division=0)
-        auc = roc_auc_score(y_true, y_proba)
-    except Exception:
-        accuracy = float(np.mean(y_true == y_pred))
-        f1 = 2 * ((accuracy * accuracy) / (accuracy + accuracy + 1e-9))
-        recall = float(np.mean(y_pred[y_true == 1] == 1)) if y_true.sum() > 0 else 0.0
-        auc = 0.77
+def predict_t1(df: pd.DataFrame, forecaster: dict) -> pd.DataFrame:
+    """HU020: pronóstico de la semana siguiente por SKU con IC 95% (ŷ ± Z_CI·RMSE)."""
+    global_rmse = forecaster["metrics"]["rmse"]
+    rmse_by_sku = forecaster["rmse_by_sku"]
+    rows, no_history = [], []
 
-    return {
-        "accuracy": round(accuracy, 4),
-        "f1_score": round(f1, 4),
-        "recall": round(recall, 4),
-        "auc": round(auc, 4)
-    }
+    for sku, hist in df.sort_values("Date").groupby("sku", sort=True):
+        fecha_t1 = hist["Date"].iloc[-1] + pd.Timedelta(days=7)
+        base = {"sku": sku, "categoria": hist["categoria"].iloc[0], "fecha_t1": fecha_t1}
+        if len(hist) < 4:
+            no_history.append(base)
+            continue
+        units = hist["unidades"].to_numpy()
+        rows.append({
+            **base,
+            "lag_1": units[-1],
+            "lag_2": units[-2],
+            "rolling_mean_4": units[-4:].mean(),
+            "week_of_year": int(fecha_t1.isocalendar()[1]),
+            "IsHoliday": 0,
+            "Temperatura_Promedio": hist["Temperatura_Promedio"].iloc[-1],
+        })
+
+    forecast = pd.DataFrame(rows)
+    if not forecast.empty:
+        pred = forecaster["model"].predict(forecast[FEATURES_REG].astype(float))
+        forecast["forecast_t1"] = np.clip(pred, 0, None)
+        forecast["rmse_usado"] = forecast["sku"].map(rmse_by_sku).fillna(global_rmse)
+        forecast["rmse_fuente"] = np.where(forecast["sku"].isin(list(rmse_by_sku)), "SKU", "Global")
+        forecast["ci_low"] = (forecast["forecast_t1"] - Z_CI * forecast["rmse_usado"]).clip(lower=0)
+        forecast["ci_high"] = forecast["forecast_t1"] + Z_CI * forecast["rmse_usado"]
+
+    empty = pd.DataFrame(no_history)
+    if not empty.empty:
+        empty[["forecast_t1", "ci_low", "ci_high", "rmse_usado"]] = 0.0
+        empty["rmse_fuente"] = "Sin historia"
+
+    columns = ["sku", "categoria", "fecha_t1", "forecast_t1", "ci_low", "ci_high", "rmse_usado", "rmse_fuente"]
+    result = pd.concat([part for part in (forecast, empty) if not part.empty], ignore_index=True)[columns]
+    numeric = ["forecast_t1", "ci_low", "ci_high", "rmse_usado"]
+    result[numeric] = result[numeric].astype(float).round(2)
+    return result.sort_values("sku").reset_index(drop=True)
 
 
-def build_order_suggestions(df: pd.DataFrame) -> pd.DataFrame:
-    """Crea tabla de sugerencias de pedido prescriptivas."""
-    suggestion_df = (
-        df.groupby(["sku", "categoria"]).agg(
-            current_stock=("unidades", "last"),
-            forecast_t1=("unidades", "mean"),
-            temperatura_promedio=("Temperatura_Promedio", "mean")
-        )
-        .reset_index()
+def simulate_current_stock(df: pd.DataFrame) -> pd.Series:
+    """Stock actual SIMULADO por SKU (el dataset no trae inventario).
+
+    stock = media de las últimas 4 semanas de unidades (≥ 0) × U(0.3, 3.0),
+    con semilla fija (42) y SKUs ordenados para que sea reproducible.
+    """
+    rng = np.random.default_rng(42)
+    base = (
+        df.sort_values("Date")
+        .groupby("sku")["unidades"]
+        .apply(lambda s: s.tail(4).mean())
+        .clip(lower=0)
+        .sort_index()
     )
-    suggestion_df["current_stock"] = (suggestion_df["current_stock"] * 5).astype(int)
-    suggestion_df["forecast_t1"] = (suggestion_df["forecast_t1"] * 7).round(0).astype(int)
-    suggestion_df["order_qty"] = (suggestion_df["forecast_t1"] - suggestion_df["current_stock"]).clip(lower=0).astype(int)
-    suggestion_df["status"] = np.select(
-        [suggestion_df["order_qty"] >= 25, suggestion_df["order_qty"] >= 10],
-        ["Crítico", "Alerta"],
-        default="Normal"
+    factors = rng.uniform(0.3, 3.0, size=len(base))
+    return (base * factors).round(2).rename("current_stock")
+
+
+def classify_stock_status(policy_df: pd.DataFrame) -> pd.DataFrame:
+    """Asigna el estado del SKU según stock efectivo (actual + en tránsito), SS y ROP."""
+    stock_efectivo = policy_df["current_stock"] + policy_df["en_transito"]
+    policy_df["stock_efectivo"] = stock_efectivo.round(2)
+    policy_df["status"] = np.select(
+        [
+            policy_df["ventas_ult_8"] <= 0,
+            stock_efectivo <= policy_df["safety_stock"],
+            stock_efectivo <= policy_df["rop"],
+            stock_efectivo > policy_df["rop"] + OVERSTOCK_COVER_WEEKS * policy_df["forecast_t1"],
+        ],
+        ["Sin Movimiento", "Crítico", "Bajo", "Sobrestock"],
+        default="Óptimo",
     )
-    suggestion_df["confidence"] = np.where(suggestion_df["order_qty"] > 0, "Alta", "Muy Alta")
-    return suggestion_df
+    policy_df["status_label"] = policy_df["status"].map(STATUS_ICON) + " " + policy_df["status"]
+    return policy_df
+
+
+def compute_order_qty(policy_df: pd.DataFrame) -> pd.DataFrame:
+    """Cantidad a pedir para SKUs Crítico/Bajo: hasta cubrir ROP + pronóstico T+1."""
+    need = np.ceil((policy_df["rop"] + policy_df["forecast_t1"] - policy_df["stock_efectivo"]).clip(lower=0))
+    policy_df["order_qty"] = np.where(policy_df["status"].isin(["Crítico", "Bajo"]), need, 0).astype(int)
+    return policy_df
+
+
+def compute_inventory_policy(df: pd.DataFrame, forecast_df: pd.DataFrame, stock: pd.Series) -> pd.DataFrame:
+    """HU017 + HU015: stock de seguridad, punto de reorden, estado y cantidad a pedir por SKU."""
+    recent = df.sort_values(["sku", "Date"]).groupby("sku").tail(DEMAND_WINDOW_WEEKS)
+    demand = (
+        recent.assign(demanda=recent["unidades"].clip(lower=0))
+        .groupby("sku")["demanda"]
+        .agg(mu="mean", sigma="std")
+        .fillna(0.0)
+    )
+    demand["safety_stock"] = Z_SERVICE * demand["sigma"] * np.sqrt(LEAD_TIME_WEEKS)
+    demand["rop"] = demand["mu"] * LEAD_TIME_WEEKS + demand["safety_stock"]
+    demand = demand.round(2)
+
+    window_start = df["Date"].max() - pd.Timedelta(weeks=NO_MOVEMENT_WEEKS)
+    ventas_recientes = df.loc[df["Date"] > window_start].groupby("sku")["unidades"].sum()
+
+    policy = forecast_df.merge(demand.reset_index(), on="sku", how="left")
+    policy["current_stock"] = policy["sku"].map(stock).fillna(0.0)
+    policy["en_transito"] = 0.0
+    policy["ventas_ult_8"] = policy["sku"].map(ventas_recientes).fillna(0.0).round(2)
+
+    classify_stock_status(policy)
+    compute_order_qty(policy)
+    return policy
+
+
+def build_inventory_state(df: pd.DataFrame, forecaster: dict) -> pd.DataFrame:
+    """Orquesta pronóstico T+1 → stock simulado → política de inventario."""
+    forecast_df = predict_t1(df, forecaster)
+    stock = simulate_current_stock(df)
+    return compute_inventory_policy(df, forecast_df, stock)
 
 
 def download_csv(dataframe: pd.DataFrame, filename: str):
@@ -316,6 +455,7 @@ def render_sidebar_menu():
         key="selected_page_radio"
     )
     st.session_state["selected_page"] = selected_page
+    render_category_filter()
 
     if st.sidebar.button("Cerrar Sesión", key="cerrar_sesion"):
         reset_session_state()
@@ -326,123 +466,297 @@ def render_sidebar_menu():
         st.session_state["selected_page"] = "Sugerencia de Pedidos"
 
 
-def render_dashboard(df: pd.DataFrame, metrics: dict, suggestions: pd.DataFrame):
-    st.subheader("Dashboard General")
-    cols = st.columns(4)
-    cols[0].metric("Exactitud del Modelo", f"{metrics['accuracy'] * 94.8:.1f}%")
-    cols[1].metric("F1-Score", f"{metrics['f1_score']:.2f}")
-    cols[2].metric("Recall", f"{metrics['recall']:.2f}")
-    cols[3].metric("AUC", f"{metrics['auc']:.2f}")
+def _reset_category_filter():
+    st.session_state["category_filter"] = list(CATEGORIES)
 
-    kpis = st.container()
-    with kpis:
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        col1, col2, col3 = st.columns([1.5, 1, 1])
-        col1.metric("Total SKUs", f"{suggestions['sku'].nunique()}")
-        col2.metric("Órdenes Sugeridas", f"{(suggestions['order_qty'] > 0).sum()}")
-        col3.metric("Stock Crítico", f"{(suggestions['status'] == 'Crítico').sum()}")
-        st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("### Serie temporal de stock y demanda predicha")
-    trend_df = (
-        df.groupby("Date")["unidades"].sum().reset_index().rename(columns={"unidades": "Stock_Total"})
-    )
-    trend_df["Predicción XGBoost"] = trend_df["Stock_Total"].shift(-1)
-    trend_df["Predicción XGBoost"] = trend_df["Predicción XGBoost"].ffill().bfill()
+def render_category_filter():
+    """Filtro global de categorías en el sidebar (aplica a todas las vistas)."""
+    if not isinstance(st.session_state.get("category_filter"), list):
+        _reset_category_filter()
+    st.sidebar.multiselect("Categorías", CATEGORIES, key="category_filter")
+    st.sidebar.button("Limpiar filtro", key="limpiar_filtro", on_click=_reset_category_filter)
 
-    line = (
-        alt.Chart(trend_df)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("Date:T", title="Fecha"),
-            y=alt.Y("Stock_Total:Q", title="Stock Total"),
-            tooltip=["Date:T", "Stock_Total:Q", "Predicción XGBoost:Q"],
-        )
-        .properties(width=800, height=360)
-    )
-    st.altair_chart(line, use_container_width=True)
 
-    st.markdown("### Controles de filtrado rápido")
-    filter_col1, filter_col2, filter_col3 = st.columns(3)
-    if filter_col1.button("Ver sólo Climatización", key="filtro_climatizacion"):
-        st.session_state["category_filter"] = "Climatización"
-    if filter_col2.button("Ver sólo Refrigeración", key="filtro_refrigeracion"):
-        st.session_state["category_filter"] = "Refrigeración"
-    if filter_col3.button("Ver sólo Ventilación", key="filtro_ventilacion"):
-        st.session_state["category_filter"] = "Ventilación"
+def apply_category_filter(df: pd.DataFrame) -> pd.DataFrame:
+    selected = st.session_state.get("category_filter", CATEGORIES)
+    filtered = df[df["categoria"].isin(selected)]
+    st.caption(f"Mostrando {filtered['sku'].nunique()} de {df['sku'].nunique()} SKUs")
+    return filtered
 
-    if st.session_state.get("category_filter"):
-        st.success(f"Filtro aplicado: {st.session_state['category_filter']}")
-        filtered = suggestions[suggestions["categoria"] == st.session_state["category_filter"]]
+
+def render_quality_badge(forecaster: dict):
+    """Badge de calidad del pronóstico (MAPE vs objetivo) y detalle de métricas."""
+    metrics = forecaster["metrics"]
+    mape = metrics["mape"]
+    if not np.isnan(mape) and mape < MAPE_TARGET:
+        background, color, text = "#dcfce7", "#166534", f"✓ MAPE {mape:.1f}% < {MAPE_TARGET:.0f}%"
     else:
-        filtered = suggestions.copy()
+        background, color, text = "#fee2e2", "#991b1b", f"✗ MAPE {mape:.1f}% ≥ {MAPE_TARGET:.0f}% — revisar modelo"
+    st.markdown(
+        f"<span style='background:{background}; color:{color}; padding:4px 12px; border-radius:999px; "
+        f"font-weight:600; font-size:14px;'>{text}</span>",
+        unsafe_allow_html=True,
+    )
+    with st.expander("Detalle de calidad"):
+        st.markdown(
+            f"- **RMSE:** {metrics['rmse']:.3f} · **MAE:** {metrics['mae']:.3f} · **MAPE:** {mape:.2f}%\n"
+            f"- **n validación:** {metrics['n']} · **n MAPE** (|y| ≥ {MAPE_MIN_ABS}): {metrics['n_mape']}\n"
+            f"- **Fuente del modelo:** {forecaster['source']} (`{os.path.basename(MODEL_FILE_REG)}`)"
+        )
+        by_category = pd.DataFrame(forecaster["metrics_by_category"]).T.rename_axis("categoria").reset_index()
+        st.dataframe(by_category, hide_index=True, width='stretch')
 
-    st.dataframe(filtered.head(12), width='stretch')
+
+def render_status_summary(state: pd.DataFrame):
+    counts = state["status"].value_counts().reindex(STATUS_ORDER, fill_value=0)
+    cols = st.columns(len(STATUS_ORDER))
+    for col, status in zip(cols, STATUS_ORDER):
+        col.metric(f"{STATUS_ICON[status]} {status}", int(counts[status]))
+
+    chart_df = counts.rename_axis("status").reset_index(name="skus")
+    chart = (
+        alt.Chart(chart_df)
+        .mark_bar()
+        .encode(
+            y=alt.Y("status:N", sort=STATUS_ORDER, title=None),
+            x=alt.X("skus:Q", title="SKUs"),
+            color=alt.Color(
+                "status:N",
+                scale=alt.Scale(domain=STATUS_ORDER, range=[STATUS_COLOR[s] for s in STATUS_ORDER]),
+                legend=None,
+            ),
+            tooltip=[alt.Tooltip("status:N", title="Estado"), alt.Tooltip("skus:Q", title="SKUs")],
+        )
+        .properties(height=200)
+    )
+    st.altair_chart(chart)
 
 
-def render_order_suggestion(df: pd.DataFrame, suggestions: pd.DataFrame):
+def render_forecast_chart(df: pd.DataFrame, forecaster: dict, forecast_df: pd.DataFrame, sku: str):
+    """Histórico real, predicción de validación y punto T+1 con su IC 95%."""
+    hist = (
+        df.loc[df["sku"] == sku, ["Date", "unidades"]]
+        .sort_values("Date")
+        .tail(52)
+        .rename(columns={"unidades": "valor"})
+        .assign(serie="Real")
+    )
+    val_df = forecaster["val_df"]
+    val = (
+        val_df.loc[val_df["sku"] == sku, ["Date", "pred"]]
+        .rename(columns={"pred": "valor"})
+        .assign(serie="Predicción validación")
+    )
+    series_domain = ["Real", "Predicción validación"]
+    lines = (
+        alt.Chart(pd.concat([hist, val], ignore_index=True))
+        .mark_line()
+        .encode(
+            x=alt.X("Date:T", title="Semana"),
+            y=alt.Y("valor:Q", title="Unidades (miles)"),
+            color=alt.Color("serie:N", title=None,
+                            scale=alt.Scale(domain=series_domain, range=["#1f2937", "#2563eb"])),
+            strokeDash=alt.StrokeDash("serie:N", legend=None,
+                                      scale=alt.Scale(domain=series_domain, range=[[1, 0], [4, 4]])),
+            tooltip=[alt.Tooltip("Date:T", title="Semana"), "serie:N",
+                     alt.Tooltip("valor:Q", title="Unidades", format=".2f")],
+        )
+    )
+
+    point_df = forecast_df.loc[forecast_df["sku"] == sku]
+    tooltip_t1 = [
+        alt.Tooltip("fecha_t1:T", title="Semana T+1"),
+        alt.Tooltip("forecast_t1:Q", title="Pronóstico", format=".2f"),
+        alt.Tooltip("ci_low:Q", title="IC 95% inf.", format=".2f"),
+        alt.Tooltip("ci_high:Q", title="IC 95% sup.", format=".2f"),
+        alt.Tooltip("rmse_usado:Q", title="RMSE usado", format=".2f"),
+    ]
+    base_t1 = alt.Chart(point_df)
+    interval = base_t1.mark_rule(color="#dc2626", strokeWidth=2).encode(
+        x="fecha_t1:T", y="ci_low:Q", y2="ci_high:Q", tooltip=tooltip_t1
+    )
+    point = base_t1.mark_point(size=160, filled=True, color="#dc2626").encode(
+        x="fecha_t1:T", y="forecast_t1:Q", tooltip=tooltip_t1
+    )
+    st.altair_chart((lines + interval + point).properties(height=380))
+
+    fuente = point_df["rmse_fuente"].iloc[0] if not point_df.empty else "Global"
+    st.caption(f"IC 95% = ŷ ± {Z_CI} · RMSE ({fuente})")
+
+
+def render_inventory_policy_table(state: pd.DataFrame):
+    with st.expander("¿Cómo se calcula?"):
+        st.markdown(
+            f"- **Lead time (LT):** {LEAD_TIME_WEEKS} semanas · **Z de servicio:** {Z_SERVICE} (95%)\n"
+            f"- **μ y σ:** demanda semanal (≥ 0) de las últimas {DEMAND_WINDOW_WEEKS} semanas del SKU\n"
+            f"- **Stock de seguridad:** SS = {Z_SERVICE}·σ·√{LEAD_TIME_WEEKS} · "
+            f"**Punto de reorden:** ROP = μ·{LEAD_TIME_WEEKS} + SS\n"
+            f"- **Estado** (stock efectivo = actual + en tránsito): Sin Movimiento si no vendió en las últimas "
+            f"{NO_MOVEMENT_WEEKS} semanas; Crítico ≤ SS; Bajo ≤ ROP; Sobrestock > ROP + "
+            f"{OVERSTOCK_COVER_WEEKS}·pronóstico T+1; si no, Óptimo\n"
+            f"- **Cantidad a pedir** (Crítico/Bajo): ⌈ROP + pronóstico T+1 − stock efectivo⌉\n"
+            f"- El stock actual es **simulado** (el dataset no contiene inventario)."
+        )
+
+    rank = {status: i for i, status in enumerate(STATUS_ORDER)}
+    view = state.assign(
+        _rank=state["status"].map(rank),
+        cobertura=np.where(state["rop"] > 0, state["stock_efectivo"] / state["rop"].where(state["rop"] > 0), 2.0).clip(0, 2),
+    ).sort_values(["_rank", "order_qty", "sku"], ascending=[True, False, True])
+    columns = ["sku", "categoria", "status_label", "current_stock", "en_transito", "safety_stock", "rop",
+               "cobertura", "forecast_t1", "order_qty"]
+    st.dataframe(
+        view[columns],
+        hide_index=True,
+        width='stretch',
+        column_config={
+            "sku": "SKU",
+            "categoria": "Categoría",
+            "status_label": "Estado",
+            "current_stock": st.column_config.NumberColumn("Stock actual", format="%.2f", help="Simulado"),
+            "en_transito": st.column_config.NumberColumn("En tránsito", format="%.2f",
+                                                         help="Órdenes generadas en esta sesión"),
+            "safety_stock": st.column_config.NumberColumn("Stock seguridad", format="%.2f",
+                                                          help=f"SS = {Z_SERVICE}·σ·√{LEAD_TIME_WEEKS}"),
+            "rop": st.column_config.NumberColumn("ROP", format="%.2f",
+                                                 help=f"ROP = μ·{LEAD_TIME_WEEKS} + SS"),
+            "cobertura": st.column_config.ProgressColumn("Cobertura", format="%.2f", min_value=0, max_value=2,
+                                                         help="Stock efectivo / ROP (1 = en el punto de reorden)"),
+            "forecast_t1": st.column_config.NumberColumn("Pronóstico T+1", format="%.2f"),
+            "order_qty": st.column_config.NumberColumn("Cantidad a pedir", format="%d",
+                                                       help="⌈ROP + pronóstico T+1 − stock efectivo⌉"),
+        },
+    )
+
+
+def render_dashboard(state: pd.DataFrame, forecaster: dict):
+    st.subheader("Dashboard General")
+    render_quality_badge(forecaster)
+
+    metrics = forecaster["metrics"]
+    cols = st.columns(3)
+    cols[0].metric("RMSE (validación)", f"{metrics['rmse']:.2f}")
+    cols[1].metric("MAE (validación)", f"{metrics['mae']:.2f}")
+    cols[2].metric("SKUs totales", f"{state['sku'].nunique()}")
+
+    st.markdown("### Estado del inventario")
+    filtered = apply_category_filter(state)
+    render_status_summary(filtered)
+
+    st.markdown("### Top 10 SKUs a reponer (Crítico / Bajo)")
+    urgent = filtered[filtered["status"].isin(["Crítico", "Bajo"])]
+    if urgent.empty:
+        st.success("No hay SKUs en estado Crítico o Bajo con el filtro actual.")
+        return
+    rank = {status: i for i, status in enumerate(STATUS_ORDER)}
+    top = (
+        urgent.assign(_rank=urgent["status"].map(rank))
+        .sort_values(["_rank", "order_qty"], ascending=[True, False])
+        .head(10)
+        .drop(columns="_rank")
+    )
+    render_inventory_policy_table(top)
+
+
+def render_forecast_page(df: pd.DataFrame, state: pd.DataFrame, forecaster: dict):
+    st.subheader("Pronóstico de Demanda")
+    st.markdown("Pronóstico de la próxima semana (T+1) por SKU con el regresor XGBoost e intervalo de confianza 95%.")
+    render_quality_badge(forecaster)
+
+    filtered = apply_category_filter(state)
+    if filtered.empty:
+        st.warning("No hay SKUs para las categorías seleccionadas.")
+        return
+
+    sku = st.selectbox("SKU", filtered["sku"].tolist(), key="forecast_sku")
+    render_forecast_chart(df, forecaster, filtered, sku)
+
+    st.markdown("#### Pronóstico T+1")
+    table = filtered[["sku", "categoria", "fecha_t1", "forecast_t1", "ci_low", "ci_high", "rmse_fuente"]].assign(
+        fecha_t1=lambda d: d["fecha_t1"].dt.strftime("%Y-%m-%d")
+    )
+    st.dataframe(table, hide_index=True, width='stretch')
+    st.download_button(
+        "⬇️ Exportar pronóstico T+1 (CSV)",
+        data=download_csv(table, "pronostico_t1.csv"),
+        file_name=f"pronostico_t1_{datetime.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+        key="dl_forecast"
+    )
+
+
+def render_order_suggestion(state: pd.DataFrame):
     st.subheader("Sugerencia de Pedidos")
     st.markdown(
-        "Sistema prescriptivo que combina stock actual, demanda pronosticada del modelo XGBoost y cantidad óptima a pedir."
+        "Política de inventario por SKU: stock de seguridad, punto de reorden y cantidad sugerida "
+        "a partir del pronóstico T+1 del regresor XGBoost."
     )
+    if st.session_state.get("order_flash"):
+        st.success(st.session_state.pop("order_flash"))
 
-    cat_options = ["Todas"] + suggestions["categoria"].sort_values().unique().tolist()
-    category_selection = st.multiselect("Filtra por categoría", cat_options, default=["Todas"], key="order_category_selection")
-    if "Todas" in category_selection and len(category_selection) == 1:
-        filtered = suggestions.copy()
+    filtered = apply_category_filter(state)
+    show = st.radio("Mostrar", ["Todos", "Crítico", "Bajo", "Requieren orden"], horizontal=True, key="order_filter")
+    if show in ("Crítico", "Bajo"):
+        view = filtered[filtered["status"] == show]
+    elif show == "Requieren orden":
+        view = filtered[filtered["order_qty"] > 0]
     else:
-        filtered = suggestions[suggestions["categoria"].isin([c for c in category_selection if c != "Todas"])]
+        view = filtered
 
-    if st.button("Aplicar filtro SKU Crítico", key="filtro_critico"):
-        st.session_state["order_filter"] = "critico"
-    if st.button("Aplicar filtro Stock Bajo", key="filtro_stock"):
-        st.session_state["order_filter"] = "bajo"
-
-    if st.session_state.get("order_filter") == "critico":
-        filtered = filtered[filtered["status"] == "Crítico"]
-    elif st.session_state.get("order_filter") == "bajo":
-        filtered = filtered[filtered["order_qty"] > 20]
-
-    if filtered.empty:
+    if view.empty:
         st.warning("No hay resultados con los filtros seleccionados.")
     else:
-        st.dataframe(filtered, width='stretch')
+        render_inventory_policy_table(view)
 
-    st.markdown("### Generar orden o emitir alerta")
-    selected_sku = st.selectbox("Selecciona SKU", filtered["sku"].unique().tolist() if not filtered.empty else ["N/A"], key="selected_sku")
-    quantity_default = 10
-    if selected_sku != "N/A" and selected_sku in filtered["sku"].values:
-        quantity_default = int(filtered.loc[filtered["sku"] == selected_sku, "order_qty"].iloc[0])
-    quantity = st.number_input("Cantidad a pedir", min_value=0, value=quantity_default, step=1, key="order_quantity")
-    if st.button("Generar Orden / Emitir Alerta", key="generar_orden") and selected_sku != "N/A":
-        if "order_history" not in st.session_state:
-            st.session_state["order_history"] = []
-        order_code = f"ORD-{datetime.now().strftime('%Y%m%d')}-{len(st.session_state['order_history'])+1:03d}"
-        st.session_state["order_history"].append({
-            "order_code": order_code,
-            "sku": selected_sku,
-            "quantity": quantity,
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "status": "Emitida"
-        })
-        st.success(f"Orden generada: {order_code} → {selected_sku}, cantidad {quantity}")
-        if selected_sku in suggestions["sku"].values:
-            suggestions.loc[suggestions["sku"] == selected_sku, "current_stock"] = (
-                suggestions.loc[suggestions["sku"] == selected_sku, "current_stock"] - quantity
-            ).clip(lower=0)
+    st.markdown("### Generar orden de compra")
+    candidates = filtered.loc[filtered["order_qty"] > 0].sort_values("order_qty", ascending=False)
+    if candidates.empty:
+        st.info("Ningún SKU requiere orden de compra con el filtro actual.")
+    else:
+        selected_sku = st.selectbox("Selecciona SKU", candidates["sku"].tolist(), key="selected_sku")
+        quantity_default = int(candidates.loc[candidates["sku"] == selected_sku, "order_qty"].iloc[0])
+        quantity = st.number_input("Cantidad a pedir", min_value=0, value=quantity_default, step=1,
+                                   key=f"order_quantity_{selected_sku}")
+        if st.button("Generar Orden de Compra", key="generar_orden"):
+            if quantity <= 0:
+                st.warning("La cantidad debe ser mayor que 0.")
+            else:
+                if "order_history" not in st.session_state:
+                    st.session_state["order_history"] = []
+                order_code = f"ORD-{datetime.now().strftime('%Y%m%d')}-{len(st.session_state['order_history'])+1:03d}"
+                st.session_state["order_history"].append({
+                    "order_code": order_code,
+                    "sku": selected_sku,
+                    "quantity": quantity,
+                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "status": "Emitida"
+                })
+                inventory = st.session_state["inventory_state"]
+                inventory.loc[inventory["sku"] == selected_sku, "en_transito"] += quantity
+                classify_stock_status(inventory)
+                compute_order_qty(inventory)
+                st.session_state["order_flash"] = (
+                    f"Orden generada: {order_code} → {selected_sku}, cantidad {quantity} (sumada a stock en tránsito)"
+                )
+                st.rerun()
 
-    if "order_history" in st.session_state and st.session_state["order_history"]:
+    if st.session_state.get("order_history"):
         st.markdown("#### Histórico de órdenes generadas")
-        history_df = pd.DataFrame(st.session_state["order_history"])
-        st.table(history_df)
+        st.dataframe(pd.DataFrame(st.session_state["order_history"]), hide_index=True, width='stretch')
 
-    csv_bytes = download_csv(filtered, "ordenes_sugeridas_refri_reporte.csv")
-    st.download_button(
-        label="Exportar Reporte (CSV)",
-        data=csv_bytes,
-        file_name="reporte_ordenes_pedido.csv",
-        mime="text/csv"
-    )
+    export = filtered.loc[filtered["order_qty"] > 0, ["sku", "categoria", "current_stock", "en_transito",
+                                                     "safety_stock", "rop", "forecast_t1", "order_qty", "status"]]
+    if export.empty:
+        st.info("No hay órdenes de compra sugeridas para exportar.")
+    else:
+        st.download_button(
+            "⬇️ Exportar órdenes de compra (CSV)",
+            data=download_csv(export, "ordenes_compra.csv"),
+            file_name=f"ordenes_compra_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+            key="dl_orders"
+        )
 
 
 def render_system_logs():
@@ -528,22 +842,21 @@ def render_app():
         df = load_dataset()
         st.session_state["dataset_processed"] = df
 
-    model_result = st.session_state.get("model_metrics")
-    if model_result is None:
-        model_result = build_synthetic_xgb(df)
-        st.session_state["model_metrics"] = model_result
+    forecaster = train_or_load_forecaster()
 
-    suggestions = st.session_state.get("suggested_orders")
-    if suggestions is None:
-        suggestions = build_order_suggestions(df)
-        st.session_state["suggested_orders"] = suggestions
+    state = st.session_state.get("inventory_state")
+    if state is None:
+        state = build_inventory_state(df, forecaster)
+        st.session_state["inventory_state"] = state
 
     selected_page = st.session_state.get("selected_page", ROLE_PAGES[st.session_state["role"]][0])
 
     if selected_page == "Dashboard General":
-        render_dashboard(df, model_result["metrics"], suggestions)
+        render_dashboard(state, forecaster)
+    elif selected_page == "Pronóstico de Demanda":
+        render_forecast_page(df, state, forecaster)
     elif selected_page == "Sugerencia de Pedidos":
-        render_order_suggestion(df, suggestions)
+        render_order_suggestion(state)
     elif selected_page == "Logs del Sistema":
         render_system_logs()
     elif selected_page == "Auditoría de Datos":
@@ -554,16 +867,18 @@ def render_app():
         st.info("Selecciona una vista válida desde el menú lateral.")
 
 
-def print_console_report(metrics: dict):
-    """Imprime en consola el reporte de métricas al arrancar la app."""
+def print_console_report(metrics: dict, source: str):
+    """Imprime en consola las métricas de validación del regresor."""
     separator = "=" * 68
+    status = "OK" if metrics["mape"] < MAPE_TARGET else "REVISAR"
     print(separator)
-    print("REFRIPERÚ | MÉTRICAS XGBOOST ASIMÉTRICO EN VALIDACIÓN")
+    print("REFRIPERÚ | REGRESOR XGBOOST DE DEMANDA - MÉTRICAS EN VALIDACIÓN")
     print(separator)
-    print(f"Accuracy : {metrics['accuracy'] * 100:.2f}%")
-    print(f"F1-Score : {metrics['f1_score']:.4f}")
-    print(f"Recall   : {metrics['recall']:.4f}")
-    print(f"AUC      : {metrics['auc']:.4f}")
+    print(f"Modelo   : {source} ({MODEL_FILE_REG})")
+    print(f"RMSE     : {metrics['rmse']:.3f}")
+    print(f"MAE      : {metrics['mae']:.3f}")
+    print(f"MAPE     : {metrics['mape']:.2f}% (objetivo < {MAPE_TARGET:.0f}%: {status})")
+    print(f"n        : {metrics['n']} (MAPE sobre {metrics['n_mape']})")
     print(separator)
 
 
@@ -578,11 +893,10 @@ def main():
     if "logged_in" not in st.session_state:
         st.session_state["logged_in"] = False
 
-    if "model_metrics" not in st.session_state:
-        df = load_dataset()
-        result = build_synthetic_xgb(df)
-        st.session_state["model_metrics"] = result
-        print_console_report(result["metrics"])
+    if "console_report_done" not in st.session_state:
+        result = train_or_load_forecaster()
+        print_console_report(result["metrics"], result["source"])
+        st.session_state["console_report_done"] = True
 
     render_app()
 
