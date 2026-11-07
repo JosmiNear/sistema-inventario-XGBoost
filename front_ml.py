@@ -168,7 +168,8 @@ def reset_session_state():
         "order_filter",
         "order_flash",
         "dataset_processed",
-        "core_parameters"
+        "core_parameters",
+        "login_error"
     ]:
         if key in st.session_state:
             del st.session_state[key]
@@ -488,6 +489,7 @@ def render_login():
             st.session_state["user_label"] = label
             st.session_state["selected_page"] = ROLE_PAGES[role][0]
             st.session_state["login_error"] = None
+            st.rerun()
         else:
             st.session_state["login_error"] = "Usuario o clave incorrectos. Verifica tus credenciales y vuelve a intentar."
 
@@ -518,6 +520,7 @@ def render_sidebar_menu():
 
     if st.sidebar.button("Cerrar Sesión", key="cerrar_sesion"):
         reset_session_state()
+        st.rerun()
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("**Acciones rápidas:**")
