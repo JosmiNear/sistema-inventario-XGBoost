@@ -880,7 +880,7 @@ def render_data_audit(df: pd.DataFrame):
 
     sample = df.sample(min(8, len(df)), random_state=42)
     st.markdown("#### Ejemplo de registros procesados")
-    st.dataframe(sample, width='stretch')
+    st.dataframe(sample.rename(columns={"categoria": "Categoría"}), width='stretch')
     st.download_button(
         "Exportar Auditoría CSV",
         data=download_csv(sample, "auditoria_datos.csv"),
