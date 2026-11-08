@@ -619,12 +619,20 @@ def render_forecast_chart(df: pd.DataFrame, forecaster: dict, forecast_df: pd.Da
                 "Date:T",
                 title="Semana",
                 axis=alt.Axis(
+                    format="%B",
                     labelExpr=(
-                        "replace(replace(replace(replace(replace(replace("
-                        "replace(replace(replace(replace(replace(replace(datum.label, "
-                        "'Jan', 'Ene'), 'Feb', 'Feb'), 'Mar', 'Mar'), 'Apr', 'Abr'), "
-                        "'May', 'May'), 'Jun', 'Jun'), 'Jul', 'Jul'), 'Aug', 'Ago'), "
-                        "'Sep', 'Sep'), 'Oct', 'Oct'), 'Nov', 'Nov'), 'Dec', 'Dic')"
+                        "datum.label === 'January' ? 'Enero' : "
+                        "datum.label === 'February' ? 'Febrero' : "
+                        "datum.label === 'March' ? 'Marzo' : "
+                        "datum.label === 'April' ? 'Abril' : "
+                        "datum.label === 'May' ? 'Mayo' : "
+                        "datum.label === 'June' ? 'Junio' : "
+                        "datum.label === 'July' ? 'Julio' : "
+                        "datum.label === 'August' ? 'Agosto' : "
+                        "datum.label === 'September' ? 'Septiembre' : "
+                        "datum.label === 'October' ? 'Octubre' : "
+                        "datum.label === 'November' ? 'Noviembre' : "
+                        "datum.label === 'December' ? 'Diciembre' : datum.label"
                     )
                 ),
             ),
