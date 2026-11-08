@@ -566,7 +566,7 @@ def render_quality_badge(forecaster: dict):
             f"- **n validación:** {metrics['n']} · **n MAPE** (|y| ≥ {MAPE_MIN_ABS}): {metrics['n_mape']}\n"
             f"- **Fuente del modelo:** {forecaster['source']} (`{os.path.basename(MODEL_FILE_REG)}`)"
         )
-        by_category = pd.DataFrame(forecaster["metrics_by_category"]).T.rename_axis("categoria").reset_index()
+        by_category = pd.DataFrame(forecaster["metrics_by_category"]).T.rename_axis("Categoría").reset_index()
         st.dataframe(by_category, hide_index=True, width='stretch')
 
 
@@ -615,7 +615,19 @@ def render_forecast_chart(df: pd.DataFrame, forecaster: dict, forecast_df: pd.Da
         alt.Chart(pd.concat([hist, val], ignore_index=True))
         .mark_line()
         .encode(
-            x=alt.X("Date:T", title="Semana"),
+            x=alt.X(
+                "Date:T",
+                title="Semana",
+                axis=alt.Axis(
+                    labelExpr=(
+                        "replace(replace(replace(replace(replace(replace("
+                        "replace(replace(replace(replace(replace(replace(datum.label, "
+                        "'Jan', 'Ene'), 'Feb', 'Feb'), 'Mar', 'Mar'), 'Apr', 'Abr'), "
+                        "'May', 'May'), 'Jun', 'Jun'), 'Jul', 'Jul'), 'Aug', 'Ago'), "
+                        "'Sep', 'Sep'), 'Oct', 'Oct'), 'Nov', 'Nov'), 'Dec', 'Dic')"
+                    )
+                ),
+            ),
             y=alt.Y("valor:Q", title="Unidades (miles)"),
             color=alt.Color("serie:N", title=None,
                             scale=alt.Scale(domain=series_domain, range=[BRAND_TEXT, BRAND_BLUE])),
@@ -740,7 +752,7 @@ def render_forecast_page(df: pd.DataFrame, state: pd.DataFrame, forecaster: dict
     st.markdown("#### Pronóstico T+1")
     table = filtered[["sku", "categoria", "fecha_t1", "forecast_t1", "ci_low", "ci_high", "rmse_fuente"]].assign(
         fecha_t1=lambda d: d["fecha_t1"].dt.strftime("%Y-%m-%d")
-    )
+    ).rename(columns={"categoria": "Categoría"})
     st.dataframe(table, hide_index=True, width='stretch')
     st.download_button(
         "⬇️ Exportar pronóstico T+1 (CSV)",
